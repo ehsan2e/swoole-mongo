@@ -1,0 +1,109 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+error_reporting(E_ALL);
+ini_set('display_errors', 'on');
+
+$loadedExtensions = get_loaded_extensions();
+$requiredExtensions = ['json', 'mongodb', 'swoole'];
+$missingExtensions = array_diff($requiredExtensions, $loadedExtensions);
+if (count($missingExtensions) > 0) {
+    error_log('The following extension(s) is/are missing: ' . implode(', ', $missingExtensions), 4);
+    exit(-1);
+}
+
+define('DB_HOST', 'mongo');
+define('DB_PORT', 27017);
+define('DB_NAME', 'swoole_mongo');
+define('COLLECTION', 'test');
+define('OBJECT_ID', '5e774940b5309447f90ac037');
+define('OP_MSG', 2013);
+/** @see https://docs.mongodb.com/manual/reference/mongodb-wire-protocol/#op-msg */
+
+Swoole\Runtime::enableCoroutine(true);
+
+$server = new Swoole\HTTP\Server("0.0.0.0", 9501);
+
+/*
+ * We initiate our server with one worker to ensure that if a coroutine accesses I/O in blocking mode and hangs its
+ * worker, the whole system become unresponsive
+ */
+$server->set([
+    'worker_num' => 1,
+    'enable_coroutine' => true,
+]);
+
+$server->on("start", function (Swoole\Http\Server $server) {
+    echo "Swoole http server is started at http://127.0.0.1:9501\n";
+});
+
+
+/**
+ * Here we use the mongodb extension to create a single document in a collection to have consistent timing
+ * @see https://github.com/proophsoftware/swoole-mongo-test/blob/master/server.php
+ */
+
+$manager = new \MongoDB\Driver\Manager(sprintf('mongodb://%s:%d', DB_HOST, DB_PORT));
+$bulk = new \MongoDB\Driver\BulkWrite();
+$objectId = new \MongoDB\BSON\ObjectId(OBJECT_ID);
+$bulk->update(
+    ['_id' => $objectId],
+    ['_id' => $objectId, 'message' => 'Hello, World!'],
+    ['multi' => false, 'upsert' => true]
+);
+$manager->executeBulkWrite(sprintf('%s.%s', DB_NAME, COLLECTION), $bulk);
+
+
+// To make things a little more production mode like we use a pool of connection
+$pool = new Swoole\ConnectionPool(function () {
+    $client = new Swoole\Coroutine\Client(SWOOLE_SOCK_TCP);
+    $client->connect(DB_HOST, DB_PORT, 0.5);
+    return $client;
+}, 15);
+
+$server->on("request", function (Swoole\Http\Request $request, Swoole\Http\Response $response) use ($pool) {
+    $cid = Co::getCid();
+    $response->header("Content-Type", "application/json");
+
+    if (isset($request->get['wrong'])) { // http://localhost:9501?wrong
+        $description = 'This is a test route that uses the mongodb extension to run a slow query against database so it responds after 10 seconds and blocks all other calls';
+        $manager = new \MongoDB\Driver\Manager(sprintf('mongodb://%s:%d', DB_HOST, DB_PORT));
+        $query = new \MongoDB\Driver\Query(['$where' => 'sleep(10000) || true']);
+        $result = $manager->executeQuery(sprintf('%s.%s', DB_NAME, COLLECTION), $query)->toArray();
+    } elseif (isset($request->get['right'])) { // http://localhost:9501?right
+        $description = 'This is a test route that uses mongodb wire protocol to run a slow query against database so it responds after 10 seconds but it does block other calls';
+        // Borrowing a connection from pool
+        $client = $pool->get();
+        // To ensure that filter will not be encoded as an array - while associative arrays are encoded as object an empty array is encoded as an array - we use an stdclass
+        $filter = new \stdClass();
+        $filter->{'$where'} = 'sleep(10000) || true';
+        $sections = \MongoDB\BSON\fromPHP(['find' => COLLECTION, 'filter' => $filter, '$db' => DB_NAME]);
+        $message = pack('V*', 21 + strlen($sections), $cid, 0, OP_MSG, 0) . "\0" . $sections;
+        $client->send($message);
+        $receivedLength = 0;
+        $responseLength = null;
+        $res = '';
+        do {
+            if (($chunk = $client->recv()) === false) {
+                Co::sleep(0.5); // sleep for half a second to prevent excessive load on CPU
+                continue;
+            }
+            $receivedLength += strlen($chunk);
+            $res .= $chunk;
+            if ((!isset($responseLength)) && (strlen($res) >= 4)) {
+                $responseLength = unpack('Vl', substr($res, 0, 4))['l'];
+            }
+        } while ((!isset($responseLength)) || ($receivedLength < $responseLength));
+        // Returning connection to pool to be reused by others;
+        $pool->put($client);
+        $result = \MongoDB\BSON\toPHP(substr($res, 21, $responseLength - 21))->cursor->firstBatch;
+    } else { // http://localhost:9501
+        $result = null;
+        $description = 'This is a test route that does not communicate with data base so it should be fast and non blocking';
+    }
+    $response->end(json_encode(compact('cid', 'description', 'result')));
+});
+
+$server->start();

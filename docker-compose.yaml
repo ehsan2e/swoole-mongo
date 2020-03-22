@@ -1,0 +1,21 @@
+version: "3.3"
+
+services:
+  application:
+    build: .
+    ports:
+      - 9501:9501
+    restart: always
+    depends_on:
+      - mongo
+    volumes:
+      - ./src:/app
+  mongo:
+    image: mongo
+    restart: always
+    volumes:
+      - type: volume
+        source: mongodata
+        target: /data/db
+volumes:
+  mongodata:
