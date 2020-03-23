@@ -12,7 +12,7 @@ $ docker-compose up -d
 The application has three routes as follows:
 - http://localhost:9501 Use this route to test if the application is responsive while your request to any of the other two routes is in progress it should resolve immediately for the right route and it should hang for the wrong route.
 - http://localhost:9501?wrong This route uses the mongodb extension to run a slow query against database so it responds after 10 seconds and blocks all other calls
-- http://localhost:9501?right This is a test route that uses MongoDB wire protocol to run a slow query against database so it responds after 10 seconds but it does block other calls
+- http://localhost:9501?right This route uses MongoDB wire protocol and swoole coroutine client to run a slow query against database so it responds after 10 seconds but it does not block other calls
 
 ## Errors
 If the solution fails to start make sure that the `src/application` is executable or change the `CMD` section in the `Dockerfile` to:
